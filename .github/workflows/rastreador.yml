@@ -2,7 +2,8 @@ name: Rastreador Empleos Australia
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    # Corre cada 2 horas en el minuto 17 (12 turnos diarios distribuidos suavemente)
+    - cron: '17 */2 * * *'
   workflow_dispatch:
 
 permissions:
@@ -11,6 +12,7 @@ permissions:
 jobs:
   rastrear:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Descargar código del repositorio
         uses: actions/checkout@v4
@@ -22,18 +24,19 @@ jobs:
           cache: 'pip'
 
       - name: Instalar librerías
-        run: pip install -r requirements.txt
+        run: pip install requests
 
-      - name: Ejecutar Rastreador y Notificar a Telegram
+      - name: Ejecutar Rastreador (Modo Anti-Bloqueo 365)
+        continue-on-error: true
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python scraper.py
 
-      - name: Guardar historial de ofertas vistas
+      - name: Sincronizar y guardar estado sin conflictos
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add seen_jobs.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Actualizar base de empleos vistos" && git push)
+          git add seen_jobs.json config.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Rotacion de turno y empleos vistos" && git pull --rebase origin main && git push)
