@@ -1,6 +1,7 @@
 {
 <<<<<<< Updated upstream
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
   "active_city": null,
 <<<<<<< Updated upstream
   "last_update_id": 158237026,
@@ -18,9 +19,14 @@
   "query_index": 0
 >>>>>>> Stashed changes
 =======
+=======
+>>>>>>> Stashed changes
   "active_city": "Perth WA",
   "last_update_id": 158237030,
   "asked_for_city": false,
   "query_index": 3
+<<<<<<< Updated upstream
+>>>>>>> Stashed changes
+=======
 >>>>>>> Stashed changes
 }
