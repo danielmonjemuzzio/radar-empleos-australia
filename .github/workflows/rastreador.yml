@@ -2,31 +2,47 @@ name: Rastreador Empleos Australia
 
 on:
   schedule:
-    # Se ejecuta cada 30 minutos de forma continua
+    # Ejecución continua cada 30 minutos (Modo Acecho en Tiempo Real)
     - cron: '*/30 * * * *'
   workflow_dispatch:
 
+# Permisos necesarios para que el bot actualice seen_jobs.json y config.json
 permissions:
   contents: write
 
+# Evita que dos ejecuciones simultáneas choquen y corrompan el historial de Git
+concurrency:
+  group: seek-australia-monitor-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Elimina el warning de deprecación de Node.js 20 en GitHub Actions
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
 jobs:
   rastrear:
+    name: Monitor Activo SEEK AU
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    steps:
-      - name: Descargar código del repositorio
-        uses: actions/checkout@v4
 
-      - name: Configurar Python 3.11
+    steps:
+      - name: Descargar repositorio con historial completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar entorno Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Instalar librerías
-        run: pip install requests
+      - name: Instalar dependencias de red
+        run: |
+          python -m pip install --upgrade pip --quiet
+          pip install --quiet requests urllib3
 
-      - name: Ejecutar Rastreador (Modo Acecho 30m)
+      - name: Ejecutar Motor de Acecho y Notificar a Telegram
         continue-on-error: true
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -34,11 +50,36 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python scraper.py
 
-      - name: Sincronizar y guardar estado sin conflictos
+      - name: Persistencia Atómica de Estado en Git
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git pull origin main --rebase --autostash || true
-          git add seen_jobs.json config.json || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Registro de ofertas vistas" && git push origin main)
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Rotacion de turno y empleos vistos" && git pull --rebase origin main && git push)
+
+          # Limpiar cualquier archivo temporal residual
+          rm -f *.tmp
+
+          # Verificar si existen archivos de estado para registrar
+          touch seen_jobs.json config.json
+          git add seen_jobs.json config.json
+
+          # Si no hubo cambios en este turno, finalizar limpiamente con código 0
+          if git diff --staged --quiet; then
+            echo "Sin cambios nuevos en el estado. Finalizando turno correctamente."
+            exit 0
+          fi
+
+          git commit -m "chore(state): actualizar empleos vistos y rotacion [skip ci]"
+
+          # Bucle de sincronización tolerante a conflictos con hasta 3 intentos
+          for i in 1 2 3; do
+            git pull --rebase -X theirs origin main || true
+            if git push origin HEAD:main; then
+              echo "Estado sincronizado exitosamente en el intento $i."
+              exit 0
+            fi
+            echo "Reintentando sincronización en 3 segundos..."
+            sleep 3
+          done
+
+          echo "Aviso: No se pudo hacer push en este ciclo, se sincronizará en el siguiente."
+          exit 0
