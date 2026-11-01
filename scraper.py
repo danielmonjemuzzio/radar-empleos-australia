@@ -15,7 +15,7 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 SEEN_FILE = "seen_jobs.json"
 CONFIG_FILE = "config.json"
 
-# Límites conservadores para operar 365 días sin bloqueos de IP ni de API
+# Límites conservadores para acecho continuo cada 30 minutos sin bloqueos de IP
 MAX_JOBS_PER_RUN = 12
 QUERIES_PER_RUN = 3
 
@@ -28,7 +28,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
 ]
 
-# 2. PALABRAS CLAVE PARA RECIÉN LLEGADOS (Se consultan en turnos rotativos)
+# 2. PALABRAS CLAVE PARA RECIÉN LLEGADOS (Se consultan en turnos rotativos continuos)
 JOB_KEYWORDS = [
     "General Labourer White Card",
     "Trade Assistant",
@@ -69,7 +69,7 @@ SERIOUS_ORGS = [
     "hoban", "persolkelly", "labourpower", "skout", "awx", "recruitwest"
 ]
 
-# 5. FILTRO ESTRICTO: Excluye universitarios y cargos Senior
+# 5. FILTRO ESTRICTO: Excluye puestos con título universitario, cargos ejecutivos y requisitos de ciudadanía
 BLACKLIST_WORDS = [
     "engineer", "engineering", "doctor", "medical", "physician", "surgeon",
     "registered nurse", "nursing", "clinical", "pharmacist", "dentist", "psychologist",
@@ -113,7 +113,6 @@ def load_seen():
     return []
 
 def save_seen(seen_list):
-    # Mantiene los últimos 4000 registros en orden cronológico exacto
     trimmed = list(dict.fromkeys(seen_list))[-4000:]
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f)
@@ -139,7 +138,7 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 def send_telegram_request(payload):
-    """Envía mensajes a Telegram respetando límites anti-spam (Error 429)."""
+    """Envía mensajes a Telegram con gestión de rate limits (Error 429)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -178,6 +177,7 @@ def normalize_city(user_text):
     return user_text.strip().title()
 
 def check_telegram_city_selection(cfg):
+    """Detecta si el usuario respondió en Telegram para cambiar la ciudad."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return cfg
 
@@ -206,7 +206,7 @@ def check_telegram_city_selection(cfg):
                             "Respóndeme con el nombre de la ciudad de Australia "
                             "(ej: <b>Perth</b>, <b>Sydney</b>, <b>Brisbane</b>, <b>Melbourne</b>, "
                             "<b>Darwin</b>, <b>Cairns</b>, <b>Karratha</b>, <b>Broome</b>...).\n\n"
-                            "<i>Apenas respondas, rastrearé esa zona de forma continua y segura.</i>"
+                            "<i>Apenas respondas, comenzará el acecho de nuevas ofertas en esa zona.</i>"
                         )
                     else:
                         chosen_city = normalize_city(text)
@@ -215,8 +215,8 @@ def check_telegram_city_selection(cfg):
                         cfg["query_index"] = 0
                         send_simple_message(
                             f"✅ <b>Ciudad activa: {html.escape(chosen_city)}</b>\n"
-                            f"Modo 365 días activado. Te iré enviando ofertas nuevas en lotes seguros "
-                            f"para no saturar los portales.\n\n"
+                            f"Modo acecho en tiempo real activado. Te notificaré en el instante "
+                            f"en que se publique una nueva oferta en <b>{html.escape(chosen_city)}</b>.\n\n"
                             f"<i>(Para cambiar de ciudad cuando quieras, escribe el nuevo nombre o /ciudad).</i>"
                         )
     except Exception as e:
@@ -228,7 +228,7 @@ def check_telegram_city_selection(cfg):
             "👋 <b>¡Hola! ¿Dónde estás buscando trabajo en Australia?</b>\n\n"
             "Escribe en este chat el nombre de la ciudad (ej: <b>Perth</b>, <b>Sydney</b>, "
             "<b>Brisbane</b>, <b>Melbourne</b>, <b>Darwin</b>, <b>Karratha</b>...).\n\n"
-            "<i>En cuanto respondas, comenzaré a enviarte ofertas de esa ubicación.</i>"
+            "<i>En cuanto respondas, empezaré a enviarte las vacantes recientes de esa ubicación.</i>"
         )
 
     save_config(cfg)
@@ -327,176 +327,4 @@ def analyze_with_ai_or_rules(job):
             "{\n"
             '  "explicacion": "Explica en 2 frases claras en español qué tareas hará exactamente en este trabajo",\n'
             '  "codigo_postal": "Código postal de 4 dígitos si aparece o el código postal aproximado de ese suburbio/ciudad en Australia",\n'
-            '  "requisitos": "Lista corta en español de tickets, licencias o requisitos físicos que piden (o indica si no pide experiencia)"\n'
-            "}\n\n"
-            f"Título: {job['title']}\nEmpresa: {job['company']}\nUbicación: {job['location']}\n"
-            f"Tipo: {job['work_type']}\nDetalle: {job['summary'][:700]}"
-        )
-        try:
-            r = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"}
-                },
-                timeout=8
-            )
-            if r.status_code == 200:
-                data = json.loads(r.json()["choices"][0]["message"]["content"])
-                es_explanation = data.get("explicacion", es_explanation)
-                postcode = data.get("codigo_postal", postcode)
-                prereqs = data.get("requisitos", prereqs)
-                time.sleep(random.uniform(2.0, 3.2))
-        except Exception as e:
-            print(f"[Aviso IA - Usando respaldo local]: {e}")
-
-    return {
-        "explicacion": es_explanation,
-        "codigo_postal": postcode,
-        "requisitos": prereqs
-    }
-
-def fetch_seek_api_stealth(keyword, location):
-    """Consulta SEEK con User-Agent rotativo y detección de bloqueo."""
-    url = "https://www.seek.com.au/api/jobsearch/v5/search"
-    params = {
-        "siteKey": "AU-Main",
-        "keywords": keyword,
-        "where": location,
-        "sortmode": "ListedDate",
-        "pageSize": 22,
-        "page": 1
-    }
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-AU,en;q=0.9",
-        "Referer": "https://www.seek.com.au/",
-        "Origin": "https://www.seek.com.au"
-    }
-    jobs = []
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=12)
-        if r.status_code in [403, 429]:
-            print(f"[Protección Anti-Ban] SEEK devolvió estado {r.status_code}. Pausando consultas hasta el próximo turno.")
-            return None
-        if r.status_code == 200:
-            data = r.json().get("data", [])
-            for item in data:
-                job_id = f"seek_{item.get('id')}"
-                title = item.get("title", "Sin título")
-                company = item.get("advertiser", {}).get("description", "Empresa Verificada en SEEK")
-                loc_list = item.get("locations", [{}])
-                loc = loc_list[0].get("label", location) if loc_list else location
-                salary = item.get("salaryLabel", "Según convenio (Award Rate)")
-                work_type = item.get("workType", "Casual / Full Time")
-                teaser = item.get("teaser", "")
-                bullets = " | ".join(item.get("bulletPoints", []))
-                full_summary = f"{teaser} {bullets}".strip()
-
-                jobs.append({
-                    "id": job_id,
-                    "title": title,
-                    "company": company,
-                    "location": loc,
-                    "salary": salary,
-                    "work_type": work_type,
-                    "portal": "SEEK AU",
-                    "url": f"https://www.seek.com.au/job/{item.get('id')}",
-                    "summary": full_summary
-                })
-    except Exception as e:
-        print(f"[Aviso Red SEEK] {keyword}: {e}")
-    return jobs
-
-def send_telegram_alert(job):
-    info = analyze_with_ai_or_rules(job)
-    vip_badge = "⭐ <b>[AGENCIA / EMPRESA TOP TIER 1]</b>\n" if is_priority_org(job["company"]) else "🇦🇺 <b>[OFERTA RECIÉN LLEGADOS]</b>\n"
-
-    msg = (
-        f"{vip_badge}"
-        f"📌 <b>{html.escape(job['title'])}</b>\n"
-        f"🏢 <b>Empresa:</b> {html.escape(job['company'])}\n"
-        f"📍 <b>Ubicación:</b> {html.escape(job['location'])}\n"
-        f"📮 <b>Código Postal:</b> {html.escape(str(info['codigo_postal']))}\n"
-        f"💰 <b>Salario:</b> {html.escape(str(job['salary']))} ({html.escape(str(job['work_type']))})\n\n"
-        f"🇪🇸 <b>¿De qué trata el trabajo?:</b>\n{html.escape(str(info['explicacion']))}\n\n"
-        f"🪪 <b>Prerrequisitos / Tickets:</b>\n{html.escape(str(info['requisitos']))}\n\n"
-        f"🌐 <b>Portal:</b> {html.escape(job['portal'])}\n"
-        f"🔗 <a href=\"{job['url']}\">POSTULAR AHORA DIRECTO</a>"
-    )
-
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    send_telegram_request(payload)
-    # Pausa aleatoria entre mensajes para comportamiento natural
-    time.sleep(random.uniform(1.8, 3.0))
-
-def main():
-    cfg = load_config()
-    cfg = check_telegram_city_selection(cfg)
-    active_city = cfg.get("active_city")
-
-    if not active_city:
-        print("Esperando selección de ciudad en Telegram.")
-        return
-
-    seen_list = load_seen()
-    seen_set = set(seen_list)
-    new_jobs_count = 0
-
-    # Seleccionar solo un lote de 3 búsquedas en este turno (Rotación circular)
-    start_idx = cfg.get("query_index", 0) % len(JOB_KEYWORDS)
-    selected_keywords = []
-    for i in range(QUERIES_PER_RUN):
-        idx = (start_idx + i) % len(JOB_KEYWORDS)
-        selected_keywords.append(JOB_KEYWORDS[idx])
-
-    # Guardar el próximo índice para el siguiente turno
-    cfg["query_index"] = (start_idx + QUERIES_PER_RUN) % len(JOB_KEYWORDS)
-    save_config(cfg)
-
-    print(f"Ciudad: {active_city} | Lote de este turno: {selected_keywords}")
-
-    for kw in selected_keywords:
-        if new_jobs_count >= MAX_JOBS_PER_RUN:
-            break
-
-        # Pausa humana aleatoria antes de consultar la web (4 a 8 segundos)
-        time.sleep(random.uniform(4.0, 8.0))
-        found = fetch_seek_api_stealth(kw, active_city)
-
-        # Si detectó bloqueo temporal (None), corta el ciclo de forma segura
-        if found is None:
-            break
-
-        for job in found:
-            if new_jobs_count >= MAX_JOBS_PER_RUN:
-                break
-            if job["id"] not in seen_set:
-                if is_valid_entry_job(job["title"], job["company"], job["summary"]):
-                    send_telegram_alert(job)
-                    seen_set.add(job["id"])
-                    seen_list.append(job["id"])
-                    new_jobs_count += 1
-                else:
-                    seen_set.add(job["id"])
-                    seen_list.append(job["id"])
-
-    save_seen(seen_list)
-    print(f"Turno finalizado con éxito. Ofertas enviadas: {new_jobs_count}")
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        # Cierra siempre en código 0 para que GitHub jamás suspenda el workflow por fallos de red
-        print(f"[Recuperación Automática] Error controlado: {e}")
-        sys.exit(0)
+            '  "requisitos": "Lista corta en español de tickets, licencias o requisitos físicos que piden (o indica si no
