@@ -4,6 +4,7 @@
 <<<<<<< Updated upstream
   "active_city": null,
 <<<<<<< Updated upstream
+<<<<<<< Updated upstream
   "last_update_id": 158237026,
   "asked_for_city": true,
   "query_index": 0
@@ -28,5 +29,10 @@
 <<<<<<< Updated upstream
 >>>>>>> Stashed changes
 =======
+>>>>>>> Stashed changes
+=======
+  "last_update_id": 158237031,
+  "asked_for_city": true,
+  "query_index": 0
 >>>>>>> Stashed changes
 }
