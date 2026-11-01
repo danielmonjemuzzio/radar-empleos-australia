@@ -2,8 +2,8 @@ name: Rastreador Empleos Australia
 
 on:
   schedule:
-    # Corre cada 2 horas en el minuto 17 (12 turnos diarios distribuidos suavemente)
-    - cron: '17 */2 * * *'
+    # Se ejecuta cada 30 minutos de forma continua
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -26,7 +26,7 @@ jobs:
       - name: Instalar librerías
         run: pip install requests
 
-      - name: Ejecutar Rastreador (Modo Anti-Bloqueo 365)
+      - name: Ejecutar Rastreador (Modo Acecho 30m)
         continue-on-error: true
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -40,5 +40,5 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git pull origin main --rebase --autostash || true
           git add seen_jobs.json config.json || true
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Actualizacion automatica de estado" && git push origin main)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Registro de ofertas vistas" && git push origin main)
           git diff --quiet && git diff --staged --quiet || (git commit -m "Rotacion de turno y empleos vistos" && git pull --rebase origin main && git push)
