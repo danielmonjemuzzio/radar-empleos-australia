@@ -1,104 +1,245 @@
 import os
 import re
+import sys
 import html
 import json
 import time
+import random
 import requests
-import pandas as pd
-from jobspy import scrape_jobs
 
 # Credenciales desde GitHub Secrets
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-SEEN_FILE = "seen_jobs.json"
 
-# 1. BÚSQUEDAS PARA RECIÉN LLEGADOS (Sin experiencia local ni título universitario)
-SEARCH_QUERIES = [
-    {"keyword": "General Labourer White Card", "location": "Western Australia"},
-    {"keyword": "Trade Assistant", "location": "Western Australia"},
-    {"keyword": "FIFO Utility", "location": "Perth WA"},
-    {"keyword": "Solar Farm Labourer", "location": "Australia"},
-    {"keyword": "Warehouse Pick Packer", "location": "Perth WA"},
-    {"keyword": "Container Unloader General Hand", "location": "Australia"},
-    {"keyword": "Kitchen Hand Housekeeping", "location": "Western Australia"},
-    {"keyword": "Civil Construction Labourer", "location": "Queensland"},
-    {"keyword": "Farm Hand", "location": "Australia"},
-    {"keyword": "Factory Hand Process Worker", "location": "Perth WA"}
+SEEN_FILE = "seen_jobs.json"
+CONFIG_FILE = "config.json"
+
+# Límites conservadores para operar 365 días sin bloqueos de IP ni de API
+MAX_JOBS_PER_RUN = 12
+QUERIES_PER_RUN = 3
+
+# 1. ROTACIÓN DE NAVEGADORES REALES (Evita huella digital de bot)
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
 ]
 
-# 2. AGENCIAS Y EMPRESAS TIER 1 (Muy abiertas a contratar Visa 462 / Casuals)
+# 2. PALABRAS CLAVE PARA RECIÉN LLEGADOS (Se consultan en turnos rotativos)
+JOB_KEYWORDS = [
+    "General Labourer White Card",
+    "Trade Assistant",
+    "FIFO Utility",
+    "Solar Farm Labourer",
+    "Warehouse Pick Packer",
+    "Container Unloader General Hand",
+    "Kitchen Hand Housekeeping",
+    "Civil Construction Labourer",
+    "Farm Hand",
+    "Factory Hand Process Worker"
+]
+
+# 3. DICCIONARIO DE CIUDADES AUSTRALIANAS
+AUSTRALIAN_CITIES = {
+    "perth": "Perth WA", "fremantle": "Fremantle WA", "mandurah": "Mandurah WA",
+    "bunbury": "Bunbury WA", "busselton": "Busselton WA", "margaret river": "Margaret River WA",
+    "albany": "Albany WA", "esperance": "Esperance WA", "kalgoorlie": "Kalgoorlie WA",
+    "geraldton": "Geraldton WA", "exmouth": "Exmouth WA", "carnarvon": "Carnarvon WA",
+    "karratha": "Karratha WA", "port hedland": "Port Hedland WA", "newman": "Newman WA",
+    "tom price": "Tom Price WA", "broome": "Broome WA", "kununurra": "Kununurra WA",
+    "sydney": "Sydney NSW", "newcastle": "Newcastle NSW", "wollongong": "Wollongong NSW",
+    "byron bay": "Byron Bay NSW", "melbourne": "Melbourne VIC", "geelong": "Geelong VIC",
+    "brisbane": "Brisbane QLD", "gold coast": "Gold Coast QLD", "sunshine coast": "Sunshine Coast QLD",
+    "cairns": "Cairns QLD", "townsville": "Townsville QLD", "mackay": "Mackay QLD",
+    "rockhampton": "Rockhampton QLD", "gladstone": "Gladstone QLD", "toowoomba": "Toowoomba QLD",
+    "darwin": "Darwin NT", "alice springs": "Alice Springs NT", "adelaide": "Adelaide SA",
+    "hobart": "Hobart TAS", "canberra": "Canberra ACT"
+}
+
+# 4. AGENCIAS Y EMPRESAS TIER 1
 SERIOUS_ORGS = [
     "programmed", "workpac", "hays", "chandler macleod", "adecco", "randstad",
     "monadelphous", "ventia", "downer", "bhp", "rio tinto", "fortescue", "fmg",
     "mineral resources", "minres", "macmahon", "perenti", "sodexo", "compass group",
     "iss facility", "civeo", "acciona", "lendlease", "cpb contractors", "bmd",
     "corestaff", "techforce", "linkforce", "agrifood", "costa group", "action workforce",
-    " Hoban", "persolkelly", "labourpower", "skout", "awx", "recruitwest"
+    "hoban", "persolkelly", "labourpower", "skout", "awx", "recruitwest"
 ]
 
-# 3. FILTRO ESTRICTO: Excluye universitarios (Medicina, Ingeniería, Arquitectura) y cargos Senior
+# 5. FILTRO ESTRICTO: Excluye universitarios y cargos Senior
 BLACKLIST_WORDS = [
-    # Carreras universitarias y salud
     "engineer", "engineering", "doctor", "medical", "physician", "surgeon",
     "registered nurse", "nursing", "clinical", "pharmacist", "dentist", "psychologist",
     "physiotherapist", "occupational therapist", "veterinarian", "vet ", "radiographer",
-    "architect", "architecture", "Draftsperson", "lawyer", "solicitor", "legal counsel",
+    "architect", "architecture", "draftsperson", "lawyer", "solicitor", "legal counsel",
     "accountant", "accounting", "auditor", "actuary", "geologist", "geophysicist",
     "metallurgist", "surveyor", "quantity surveyor", "agronomist", "teacher", "lecturer",
-    # Grados académicos y niveles ejecutivos
     "bachelor", "master's", "phd", "tertiary qualification", "university degree",
     "senior manager", "general manager", "director", "principal", "head of",
     "lead ", "superintendent", "project manager", "supervisor", "coordinator",
-    # Restricciones migratorias incompatibles con WHV 462 y spam
     "australian citizen", "citizens only", "pr only", "permanent resident only",
     "nv1", "nv2", "baseline clearance", "unpaid", "commission only", "survey",
     "au pair", "mystery shopper", "mlm", "crypto", "volunteer"
 ]
 
-# 4. MAPA DE CÓDIGOS POSTALES DE REFERENCIA EN AUSTRALIA
+# 6. MAPA DE CÓDIGOS POSTALES DE REFERENCIA
 POSTCODE_MAP = {
-    "perth": "6000 (Metro WA)", "fremantle": "6160 (WA)", "rockingham": "6168 (WA)",
-    "mandurah": "6210 (Regional WA - 88 días)", "bunbury": "6230 (Regional WA - 88 días)",
-    "busselton": "6280 (Regional WA - 88 días)", "margaret river": "6285 (Regional WA - 88 días)",
-    "albany": "6330 (Regional WA - 88 días)", "esperance": "6450 (Regional WA - 88 días)",
-    "kalgoorlie": "6430 (Regional WA - 88 días)", "geraldton": "6530 (Regional WA - 88 días)",
-    "carnarvon": "6701 (Norte WA - 88 días)", "exmouth": "6707 (Norte WA - 88 días)",
-    "karratha": "6714 (Norte/Pilbara WA - 88 días)", "port hedland": "6721 (Norte/Pilbara WA - 88 días)",
-    "newman": "6753 (Norte/Pilbara WA - 88 días)", "tom price": "6751 (Norte/Pilbara WA - 88 días)",
-    "broome": "6725 (Norte/Kimberley WA - 88 días)", "kununurra": "6743 (Norte WA - 88 días)",
-    "pilbara": "6714-6753 (Norte WA - 88 días)", "kimberley": "6725-6743 (Norte WA - 88 días)",
-    "darwin": "0800 (Todo NT cuenta para 88 días)", "alice springs": "0870 (NT - 88 días)",
-    "cairns": "4870 (Norte QLD - 88 días)", "townsville": "4810 (Norte QLD - 88 días)",
-    "mackay": "4740 (Regional QLD - 88 días)", "rockhampton": "4700 (Regional QLD - 88 días)",
-    "gladstone": "4680 (Regional QLD - 88 días)", "toowoomba": "4350 (Regional QLD - 88 días)",
-    "brisbane": "4000 (Metro QLD)", "gold coast": "4217 (QLD)", "sydney": "2000 (Metro NSW)",
-    "melbourne": "3000 (Metro VIC)", "adelaide": "5000 (Todo SA cuenta para 88 días en construcción)"
+    "perth": "6000 (WA)", "fremantle": "6160 (WA)", "rockingham": "6168 (WA)",
+    "mandurah": "6210 (WA)", "bunbury": "6230 (WA)", "busselton": "6280 (WA)",
+    "margaret river": "6285 (WA)", "albany": "6330 (WA)", "esperance": "6450 (WA)",
+    "kalgoorlie": "6430 (WA)", "geraldton": "6530 (WA)", "carnarvon": "6701 (WA)",
+    "exmouth": "6707 (WA)", "karratha": "6714 (WA)", "port hedland": "6721 (WA)",
+    "newman": "6753 (WA)", "tom price": "6751 (WA)", "broome": "6725 (WA)",
+    "kununurra": "6743 (WA)", "darwin": "0800 (NT)", "alice springs": "0870 (NT)",
+    "cairns": "4870 (QLD)", "townsville": "4810 (QLD)", "mackay": "4740 (QLD)",
+    "rockhampton": "4700 (QLD)", "gladstone": "4680 (QLD)", "toowoomba": "4350 (QLD)",
+    "brisbane": "4000 (QLD)", "gold coast": "4217 (QLD)", "sunshine coast": "4558 (QLD)",
+    "sydney": "2000 (NSW)", "newcastle": "2300 (NSW)", "wollongong": "2500 (NSW)",
+    "melbourne": "3000 (VIC)", "geelong": "3220 (VIC)", "adelaide": "5000 (SA)",
+    "hobart": "7000 (TAS)", "canberra": "2600 (ACT)"
 }
 
 def load_seen():
     if os.path.exists(SEEN_FILE):
         try:
             with open(SEEN_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
+                data = json.load(f)
+                return list(dict.fromkeys(data))
         except Exception:
-            return set()
-    return set()
+            return []
+    return []
 
-def save_seen(seen_set):
-    seen_list = list(seen_set)[-5000:]
+def save_seen(seen_list):
+    # Mantiene los últimos 4000 registros en orden cronológico exacto
+    trimmed = list(dict.fromkeys(seen_list))[-4000:]
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(seen_list, f)
+        json.dump(trimmed, f)
+
+def load_config():
+    default_cfg = {
+        "active_city": None,
+        "last_update_id": 0,
+        "asked_for_city": False,
+        "query_index": 0
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                default_cfg.update(loaded)
+        except Exception:
+            pass
+    return default_cfg
+
+def save_config(cfg):
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+
+def send_telegram_request(payload):
+    """Envía mensajes a Telegram respetando límites anti-spam (Error 429)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for attempt in range(2):
+        try:
+            r = requests.post(api_url, json=payload, timeout=12)
+            if r.status_code == 200:
+                return True
+            if r.status_code == 429:
+                retry_after = r.json().get("parameters", {}).get("retry_after", 10)
+                print(f"[Telegram Rate Limit] Esperando {retry_after}s...")
+                time.sleep(min(int(retry_after) + 1, 30))
+            else:
+                return False
+        except Exception as e:
+            print(f"[Aviso Telegram]: {e}")
+            time.sleep(2)
+    return False
+
+def send_simple_message(text_html):
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text_html,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    send_telegram_request(payload)
+
+def normalize_city(user_text):
+    clean = user_text.strip().lower()
+    if clean in AUSTRALIAN_CITIES:
+        return AUSTRALIAN_CITIES[clean]
+    for key, val in AUSTRALIAN_CITIES.items():
+        if key in clean:
+            return val
+    return user_text.strip().title()
+
+def check_telegram_city_selection(cfg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return cfg
+
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"offset": cfg.get("last_update_id", 0) + 1, "timeout": 5}
+    try:
+        r = requests.get(api_url, params=params, timeout=10)
+        if r.status_code == 200:
+            updates = r.json().get("result", [])
+            for u in updates:
+                update_id = u.get("update_id", 0)
+                if update_id > cfg.get("last_update_id", 0):
+                    cfg["last_update_id"] = update_id
+
+                msg = u.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text = msg.get("text", "").strip()
+
+                if chat_id == str(TELEGRAM_CHAT_ID) and text:
+                    lower_t = text.lower()
+                    if lower_t in ["/start", "/ciudad", "/zona", "cambiar", "ciudad", "hola"]:
+                        cfg["active_city"] = None
+                        cfg["asked_for_city"] = True
+                        send_simple_message(
+                            "📍 <b>¿Dónde estás buscando trabajo?</b>\n\n"
+                            "Respóndeme con el nombre de la ciudad de Australia "
+                            "(ej: <b>Perth</b>, <b>Sydney</b>, <b>Brisbane</b>, <b>Melbourne</b>, "
+                            "<b>Darwin</b>, <b>Cairns</b>, <b>Karratha</b>, <b>Broome</b>...).\n\n"
+                            "<i>Apenas respondas, rastrearé esa zona de forma continua y segura.</i>"
+                        )
+                    else:
+                        chosen_city = normalize_city(text)
+                        cfg["active_city"] = chosen_city
+                        cfg["asked_for_city"] = False
+                        cfg["query_index"] = 0
+                        send_simple_message(
+                            f"✅ <b>Ciudad activa: {html.escape(chosen_city)}</b>\n"
+                            f"Modo 365 días activado. Te iré enviando ofertas nuevas en lotes seguros "
+                            f"para no saturar los portales.\n\n"
+                            f"<i>(Para cambiar de ciudad cuando quieras, escribe el nuevo nombre o /ciudad).</i>"
+                        )
+    except Exception as e:
+        print(f"[Aviso lectura Telegram]: {e}")
+
+    if not cfg.get("active_city") and not cfg.get("asked_for_city"):
+        cfg["asked_for_city"] = True
+        send_simple_message(
+            "👋 <b>¡Hola! ¿Dónde estás buscando trabajo en Australia?</b>\n\n"
+            "Escribe en este chat el nombre de la ciudad (ej: <b>Perth</b>, <b>Sydney</b>, "
+            "<b>Brisbane</b>, <b>Melbourne</b>, <b>Darwin</b>, <b>Karratha</b>...).\n\n"
+            "<i>En cuanto respondas, comenzaré a enviarte ofertas de esa ubicación.</i>"
+        )
+
+    save_config(cfg)
+    return cfg
 
 def is_valid_entry_job(title, company, description=""):
-    """Filtra carreras universitarias, puestos senior y restricciones de ciudadanía."""
     full_text = f"{title} {company} {description}".lower()
     title_lower = title.lower()
-    # Verificar palabras prohibidas en título y descripción
     for bad in BLACKLIST_WORDS:
         if bad in title_lower:
             return False
-    # Bloquear si pide explícitamente título universitario o ciudadanía en la descripción
     strict_desc_blocks = [
         "bachelor degree", "tertiary qualification in engineering", "australian citizens only",
         "must be an australian citizen", "permanent residents only", "ahpra registration"
@@ -112,23 +253,18 @@ def is_priority_org(company):
     return any(org in comp_lower for org in SERIOUS_ORGS)
 
 def detect_postcode(location_text, description_text=""):
-    """Busca un código postal australiano de 4 dígitos o lo deduce por la ciudad/región."""
     combined = f"{location_text} {description_text}"
-    # Buscar código postal explícito de 4 dígitos (Rango australiano 0800-7999)
     matches = re.findall(r'\b(08\d{2}|[2-7]\d{3})\b', combined)
     for m in matches:
-        # Evitar confundir años (2024, 2025, 2026) con códigos postales a menos que sea Sydney (2000)
-        if m not in ["2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027"]:
+        if m not in ["2020", "2021", "2022", "2023", "2024", "2025", "2026", "2027", "2028"]:
             return f"{m} (Extraído del anuncio)"
-    
     loc_lower = location_text.lower()
     for city, code_info in POSTCODE_MAP.items():
         if city in loc_lower:
             return code_info
-    return "No especificado en el texto (Consultar ciudad en el anuncio)"
+    return "Consultar suburbio en el enlace"
 
 def detect_prerequisites(text):
-    """Detecta los tickets, licencias o requisitos básicos que pide el trabajo."""
     t = text.lower()
     reqs = []
     if "white card" in t or "construction induction" in t:
@@ -151,30 +287,17 @@ def detect_prerequisites(text):
         reqs.append("Licencia de camión (MR/HR)")
     if "ppe" in t or "steel cap" in t:
         reqs.append("EPP básico (Bototos punta de acero / ropa reflectante)")
-        
     if not reqs:
         return "Ningún ticket especial mencionado (Ideal para recién llegados)"
     return ", ".join(reqs)
 
-def evaluate_visa_462(title, company, work_type, text):
-    """Evalúa qué tan abierta es la vacante para portadores de Working Holiday 462."""
-    combined = f"{title} {company} {work_type} {text}".lower()
-    if any(k in combined for k in ["whv", "working holiday", "462", "417", "backpacker", "88 days", "2nd year visa"]):
-        return "🟢 MUY ALTA (Menciona explícitamente Working Holiday / 88 días)"
-    if is_priority_org(company) or "casual" in combined or "temp" in combined or "labour hire" in combined or "immediate start" in combined:
-        return "🟢 ALTA (Modalidad Casual / Agencia Labour Hire / Inicio inmediato, muy amigable con Visa 462)"
-    if "contract" in combined or "fixed term" in combined or "fifo" in combined:
-        return "🟢 ALTA (Contrato por obra/turno, compatible con el límite de 6 meses de la 462)"
-    return "🟡 MEDIA-ALTA (Puesto operativo de entrada; postular indicando disponibilidad inmediata)"
-
 def fallback_spanish_summary(title, details):
-    """Traduce y explica de qué trata el puesto en español si no se usa IA externa."""
     t = f"{title} {details}".lower()
     explicaciones = []
     if "solar" in t:
         explicaciones.append("Trabajo operativo en planta solar (montaje de paneles, movimiento de materiales y asistencia en terreno).")
     if "fifo" in t or "utility" in t or "housekeeping" in t or "camp" in t:
-        explicaciones.append("Puesto en campamento minero/remoto (limpieza de habitaciones, ayuda en cocina/comedor o mantenimiento general del campamento).")
+        explicaciones.append("Puesto en campamento/hotel (limpieza de habitaciones, ayuda en cocina/comedor o mantenimiento general).")
     if "trade assistant" in t or "ta " in t:
         explicaciones.append("Ayudante de oficios técnicos (asistir a mecánicos, electricistas o soldadores pasando herramientas y preparando el área).")
     if "warehouse" in t or "pick" in t or "packer" in t or "storeperson" in t or "container" in t:
@@ -187,31 +310,27 @@ def fallback_spanish_summary(title, details):
         explicaciones.append("Trabajo agrícola o de campo (cosecha, empaque, mantenimiento de cultivos o manejo de maquinaria básica).")
     if "factory" in t or "process worker" in t or "production" in t:
         explicaciones.append("Operario de planta de producción o fábrica (línea de ensamblaje, empaque y control básico).")
-        
     if not explicaciones:
         explicaciones.append("Puesto operativo de entrada (asistencia física, tareas manuales y apoyo general al equipo en terreno).")
     return " ".join(explicaciones)
 
 def analyze_with_ai_or_rules(job):
-    """Usa Groq AI para generar el análisis en español o usa el motor de reglas si no hay API key."""
     raw_text = f"{job['title']} | {job['work_type']} | {job['summary']}"
     postcode = detect_postcode(job["location"], job["summary"])
     prereqs = detect_prerequisites(raw_text)
-    visa_status = evaluate_visa_462(job["title"], job["company"], job["work_type"], raw_text)
     es_explanation = fallback_spanish_summary(job["title"], job["summary"])
 
     if GROQ_API_KEY:
         prompt = (
-            "Eres un asesor laboral experto en Australia para recién llegados con Working Holiday Visa 462. "
-            "Analiza esta oferta en inglés y responde ÚNICAMENTE con un objeto JSON válido con estas 4 claves exactas en español:\n"
+            "Eres un asesor laboral experto en Australia para recién llegados. "
+            "Analiza esta oferta en inglés y responde ÚNICAMENTE con un objeto JSON válido con estas 3 claves exactas en español:\n"
             "{\n"
             '  "explicacion": "Explica en 2 frases claras en español qué tareas hará exactamente en este trabajo",\n'
-            '  "codigo_postal": "Código postal de 4 dígitos si aparece o el código postal aproximado de ese suburbio/ciudad en Australia y si cuenta para los 88 días",\n'
-            '  "requisitos": "Lista corta en español de tickets, licencias o requisitos físicos que piden (o indica si no pide experiencia)",\n'
-            '  "visa_462": "Indica (🟢 ALTA o 🟡 MEDIA) y explica brevemente por qué es buena opción para un recién llegado con Visa 462"\n'
+            '  "codigo_postal": "Código postal de 4 dígitos si aparece o el código postal aproximado de ese suburbio/ciudad en Australia",\n'
+            '  "requisitos": "Lista corta en español de tickets, licencias o requisitos físicos que piden (o indica si no pide experiencia)"\n'
             "}\n\n"
             f"Título: {job['title']}\nEmpresa: {job['company']}\nUbicación: {job['location']}\n"
-            f"Tipo: {job['work_type']}\nDetalle: {job['summary'][:800]}"
+            f"Tipo: {job['work_type']}\nDetalle: {job['summary'][:700]}"
         )
         try:
             r = requests.post(
@@ -223,44 +342,47 @@ def analyze_with_ai_or_rules(job):
                     "temperature": 0.2,
                     "response_format": {"type": "json_object"}
                 },
-                timeout=12
+                timeout=8
             )
             if r.status_code == 200:
                 data = json.loads(r.json()["choices"][0]["message"]["content"])
                 es_explanation = data.get("explicacion", es_explanation)
                 postcode = data.get("codigo_postal", postcode)
                 prereqs = data.get("requisitos", prereqs)
-                visa_status = data.get("visa_462", visa_status)
-                # Pequeña pausa para respetar límite gratuito de Groq
-                time.sleep(2.1)
+                time.sleep(random.uniform(2.0, 3.2))
         except Exception as e:
-            print(f"[Aviso IA - Usando motor local]: {e}")
+            print(f"[Aviso IA - Usando respaldo local]: {e}")
 
     return {
         "explicacion": es_explanation,
         "codigo_postal": postcode,
-        "requisitos": prereqs,
-        "visa_462": visa_status
+        "requisitos": prereqs
     }
 
-def fetch_seek_api(keyword, location):
-    """Consulta la API JSON v5 de SEEK Australia."""
+def fetch_seek_api_stealth(keyword, location):
+    """Consulta SEEK con User-Agent rotativo y detección de bloqueo."""
     url = "https://www.seek.com.au/api/jobsearch/v5/search"
     params = {
         "siteKey": "AU-Main",
         "keywords": keyword,
         "where": location,
         "sortmode": "ListedDate",
-        "pageSize": 35,
+        "pageSize": 22,
         "page": 1
     }
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json"
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-AU,en;q=0.9",
+        "Referer": "https://www.seek.com.au/",
+        "Origin": "https://www.seek.com.au"
     }
     jobs = []
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=15)
+        r = requests.get(url, params=params, headers=headers, timeout=12)
+        if r.status_code in [403, 429]:
+            print(f"[Protección Anti-Ban] SEEK devolvió estado {r.status_code}. Pausando consultas hasta el próximo turno.")
+            return None
         if r.status_code == 200:
             data = r.json().get("data", [])
             for item in data:
@@ -287,56 +409,10 @@ def fetch_seek_api(keyword, location):
                     "summary": full_summary
                 })
     except Exception as e:
-        print(f"[Error SEEK] {keyword}: {e}")
-    return jobs
-
-def fetch_jobspy_portals(keyword, location):
-    """Extrae de Indeed Australia y LinkedIn."""
-    jobs = []
-    try:
-        df = scrape_jobs(
-            site_name=["indeed", "linkedin"],
-            search_term=keyword,
-            location=location,
-            results_wanted=20,
-            hours_old=24,
-            country_indeed="Australia"
-        )
-        if df is not None and not df.empty:
-            for _, row in df.iterrows():
-                raw_id = str(row.get("id", row.get("job_url", "")))
-                job_id = f"spy_{raw_id[-25:]}"
-                title = str(row.get("title", "Sin título"))
-                company = str(row.get("company", "Empresa Directa"))
-                loc = str(row.get("location", location))
-                site = str(row.get("site", "Portal")).upper()
-                url = str(row.get("job_url", ""))
-                desc = str(row.get("description", ""))[:600]
-                job_type = str(row.get("job_type", "Entry-Level"))
-
-                min_s = row.get("min_amount")
-                max_s = row.get("max_amount")
-                salary = f"${min_s} - ${max_s} AUD" if pd.notna(min_s) else "Según convenio (Award)"
-
-                jobs.append({
-                    "id": job_id,
-                    "title": title,
-                    "company": company,
-                    "location": loc,
-                    "salary": salary,
-                    "work_type": job_type,
-                    "portal": site,
-                    "url": url,
-                    "summary": desc if desc != "nan" else ""
-                })
-    except Exception as e:
-        print(f"[Error JobSpy] {keyword}: {e}")
+        print(f"[Aviso Red SEEK] {keyword}: {e}")
     return jobs
 
 def send_telegram_alert(job):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
     info = analyze_with_ai_or_rules(job)
     vip_badge = "⭐ <b>[AGENCIA / EMPRESA TOP TIER 1]</b>\n" if is_priority_org(job["company"]) else "🇦🇺 <b>[OFERTA RECIÉN LLEGADOS]</b>\n"
 
@@ -349,46 +425,78 @@ def send_telegram_alert(job):
         f"💰 <b>Salario:</b> {html.escape(str(job['salary']))} ({html.escape(str(job['work_type']))})\n\n"
         f"🇪🇸 <b>¿De qué trata el trabajo?:</b>\n{html.escape(str(info['explicacion']))}\n\n"
         f"🪪 <b>Prerrequisitos / Tickets:</b>\n{html.escape(str(info['requisitos']))}\n\n"
-        f"🛂 <b>Apertura Visa 462:</b>\n{html.escape(str(info['visa_462']))}\n\n"
         f"🌐 <b>Portal:</b> {html.escape(job['portal'])}\n"
         f"🔗 <a href=\"{job['url']}\">POSTULAR AHORA DIRECTO</a>"
     )
 
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": msg,
         "parse_mode": "HTML",
         "disable_web_page_preview": True
     }
-    try:
-        requests.post(api_url, json=payload, timeout=10)
-        time.sleep(1.2)
-    except Exception as e:
-        print(f"Error enviando a Telegram: {e}")
+    send_telegram_request(payload)
+    # Pausa aleatoria entre mensajes para comportamiento natural
+    time.sleep(random.uniform(1.8, 3.0))
 
 def main():
-    seen_jobs = load_seen()
+    cfg = load_config()
+    cfg = check_telegram_city_selection(cfg)
+    active_city = cfg.get("active_city")
+
+    if not active_city:
+        print("Esperando selección de ciudad en Telegram.")
+        return
+
+    seen_list = load_seen()
+    seen_set = set(seen_list)
     new_jobs_count = 0
 
-    for q in SEARCH_QUERIES:
-        kw, loc = q["keyword"], q["location"]
-        print(f"Rastreando vacantes de entrada: {kw} en {loc}...")
+    # Seleccionar solo un lote de 3 búsquedas en este turno (Rotación circular)
+    start_idx = cfg.get("query_index", 0) % len(JOB_KEYWORDS)
+    selected_keywords = []
+    for i in range(QUERIES_PER_RUN):
+        idx = (start_idx + i) % len(JOB_KEYWORDS)
+        selected_keywords.append(JOB_KEYWORDS[idx])
 
-        found = fetch_seek_api(kw, loc) + fetch_jobspy_portals(kw, loc)
+    # Guardar el próximo índice para el siguiente turno
+    cfg["query_index"] = (start_idx + QUERIES_PER_RUN) % len(JOB_KEYWORDS)
+    save_config(cfg)
+
+    print(f"Ciudad: {active_city} | Lote de este turno: {selected_keywords}")
+
+    for kw in selected_keywords:
+        if new_jobs_count >= MAX_JOBS_PER_RUN:
+            break
+
+        # Pausa humana aleatoria antes de consultar la web (4 a 8 segundos)
+        time.sleep(random.uniform(4.0, 8.0))
+        found = fetch_seek_api_stealth(kw, active_city)
+
+        # Si detectó bloqueo temporal (None), corta el ciclo de forma segura
+        if found is None:
+            break
 
         for job in found:
-            if job["id"] not in seen_jobs:
+            if new_jobs_count >= MAX_JOBS_PER_RUN:
+                break
+            if job["id"] not in seen_set:
                 if is_valid_entry_job(job["title"], job["company"], job["summary"]):
                     send_telegram_alert(job)
-                    seen_jobs.add(job["id"])
+                    seen_set.add(job["id"])
+                    seen_list.append(job["id"])
                     new_jobs_count += 1
                 else:
-                    # Marcar como visto para no volver a evaluar carreras universitarias descartadas
-                    seen_jobs.add(job["id"])
+                    seen_set.add(job["id"])
+                    seen_list.append(job["id"])
 
-    save_seen(seen_jobs)
-    print(f"Proceso completado. Nuevas ofertas enviadas en español: {new_jobs_count}")
+    save_seen(seen_list)
+    print(f"Turno finalizado con éxito. Ofertas enviadas: {new_jobs_count}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Cierra siempre en código 0 para que GitHub jamás suspenda el workflow por fallos de red
+        print(f"[Recuperación Automática] Error controlado: {e}")
+        sys.exit(0)
