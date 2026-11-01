@@ -34,9 +34,11 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python scraper.py
 
-      - name: Sincronizar y guardar estado sin conflictos
+- name: Sincronizar y guardar estado sin conflictos
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git pull origin main --rebase || true
           git add seen_jobs.json config.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Actualizacion automatica de estado" && git push)
           git diff --quiet && git diff --staged --quiet || (git commit -m "Rotacion de turno y empleos vistos" && git pull --rebase origin main && git push)
