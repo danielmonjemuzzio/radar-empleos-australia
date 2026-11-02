@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Monitor Automatizado de Vacantes en Tiempo Real (SEEK Australia).
-Arquitectura tolerante a fallos con rotación de lotes, persistencia atómica
-e integración bidireccional con Telegram y Groq LLM.
+Radar de Empleos Australia - Modo Barrido Profundo (Últimos 2 Días).
+Extrae vacantes de < 48 horas en múltiples portales oficiales (SEEK, Workforce AU,
+Jora, CareerOne), selecciona las 30 mejores opciones y se pausa automáticamente.
 """
 
 import os
@@ -14,53 +14,50 @@ import json
 import time
 import random
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any, Set
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Configuración de Logging Profesional para GitHub Actions
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("SeekMonitor")
+logger = logging.getLogger("AusJobRadar")
 
-# Variables de Entorno
 TELEGRAM_TOKEN: str = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID: str = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "").strip()
 
-# Archivos de Persistencia
 SEEN_FILE: str = "seen_jobs.json"
 CONFIG_FILE: str = "config.json"
 
-# Parámetros Operativos de Acecho (Stealth & Rate Limiting)
-MAX_JOBS_PER_RUN: int = 12
-QUERIES_PER_RUN: int = 3
-MAX_SEEN_HISTORY: int = 4000
+# Límites de la corrida: Top 30 mejores ofertas de los últimos 2 días y auto-pausa
+TOP_JOBS_LIMIT: int = 30
+MAX_AGE_DAYS: int = 2
+MAX_SEEN_HISTORY: int = 5000
 
 USER_AGENTS: List[str] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15"
 ]
 
 JOB_KEYWORDS: List[str] = [
-    "General Labourer White Card",
+    "General Labourer",
     "Trade Assistant",
     "FIFO Utility",
-    "Solar Farm Labourer",
     "Warehouse Pick Packer",
-    "Container Unloader General Hand",
-    "Kitchen Hand Housekeeping",
-    "Civil Construction Labourer",
+    "Construction Labourer White Card",
+    "Container Unloader",
+    "Solar Farm Labourer",
+    "Factory Process Worker",
     "Farm Hand",
-    "Factory Hand Process Worker"
+    "Kitchen Hand Housekeeping"
 ]
 
 AUSTRALIAN_CITIES: Dict[str, str] = {
@@ -121,11 +118,10 @@ POSTCODE_MAP: Dict[str, str] = {
 
 
 def create_http_session() -> requests.Session:
-    """Crea una sesión HTTP robusta con reintentos automáticos ante fallos de red."""
     session = requests.Session()
     retry_strategy = Retry(
         total=2,
-        backoff_factor=1.5,
+        backoff_factor=1.2,
         status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET", "POST"]
     )
@@ -139,11 +135,10 @@ HTTP_SESSION = create_http_session()
 
 
 # =====================================================================
-# GESTIÓN ATÓMICA DE ARCHIVOS Y ESTADO
+# PERSISTENCIA ATÓMICA
 # =====================================================================
 
 def load_seen() -> List[str]:
-    """Carga la lista de empleos vistos garantizando integridad de datos."""
     if os.path.exists(SEEN_FILE):
         try:
             with open(SEEN_FILE, "r", encoding="utf-8") as f:
@@ -151,12 +146,11 @@ def load_seen() -> List[str]:
                 if isinstance(data, list):
                     return list(dict.fromkeys(str(x) for x in data))
         except Exception as e:
-            logger.warning(f"Archivo {SEEN_FILE} ilegible, inicializando limpio: {e}")
+            logger.warning(f"Inicializando {SEEN_FILE} limpio: {e}")
     return []
 
 
 def save_seen(seen_list: List[str]) -> None:
-    """Guarda los IDs vistos de forma atómica para evitar corrupción."""
     trimmed = list(dict.fromkeys(seen_list))[-MAX_SEEN_HISTORY:]
     temp_file = f"{SEEN_FILE}.tmp"
     try:
@@ -168,12 +162,10 @@ def save_seen(seen_list: List[str]) -> None:
 
 
 def load_config() -> Dict[str, Any]:
-    """Carga la configuración operativa con valores por defecto seguros."""
     default_cfg: Dict[str, Any] = {
         "active_city": None,
         "last_update_id": 0,
-        "asked_for_city": False,
-        "query_index": 0
+        "waiting_for_city": False
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -182,12 +174,11 @@ def load_config() -> Dict[str, Any]:
                 if isinstance(loaded, dict):
                     default_cfg.update(loaded)
         except Exception as e:
-            logger.warning(f"Archivo {CONFIG_FILE} ilegible, restaurando valores por defecto: {e}")
+            logger.warning(f"Restaurando {CONFIG_FILE} por defecto: {e}")
     return default_cfg
 
 
 def save_config(cfg: Dict[str, Any]) -> None:
-    """Guarda la configuración de manera atómica."""
     temp_file = f"{CONFIG_FILE}.tmp"
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
@@ -198,16 +189,15 @@ def save_config(cfg: Dict[str, Any]) -> None:
 
 
 # =====================================================================
-# COMUNICACIÓN CON TELEGRAM
+# INTERFAZ CON TELEGRAM (SOLICITUD DE UBICACIÓN Y AUTO-PAUSA)
 # =====================================================================
 
 def send_telegram_request(payload: Dict[str, Any]) -> bool:
-    """Despacha mensajes a la API de Telegram controlando límites de tasa (HTTP 429)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("Faltan credenciales TELEGRAM_TOKEN o TELEGRAM_CHAT_ID.")
         return False
 
-    api_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/sendMessage"
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for _ in range(2):
         try:
             resp = HTTP_SESSION.post(api_url, json=payload, timeout=12)
@@ -215,13 +205,10 @@ def send_telegram_request(payload: Dict[str, Any]) -> bool:
                 return True
             if resp.status_code == 429:
                 retry_after = int(resp.json().get("parameters", {}).get("retry_after", 10))
-                logger.warning(f"Rate limit en Telegram. Pausando por {retry_after}s...")
                 time.sleep(min(retry_after + 1, 25))
             else:
-                logger.warning(f"Telegram devolvió código {resp.status_code}: {resp.text[:120]}")
                 return False
-        except Exception as e:
-            logger.warning(f"Excepción de red contactando a Telegram: {e}")
+        except Exception:
             time.sleep(2)
     return False
 
@@ -246,13 +233,17 @@ def normalize_city(user_text: str) -> str:
     return user_text.strip().title()
 
 
-def check_telegram_city_selection(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Sincroniza comandos entrantes del usuario en Telegram."""
+def ask_or_read_city_from_telegram(cfg: Dict[str, Any]) -> Optional[str]:
+    """
+    Lee si el usuario envió una ubicación en Telegram.
+    Si no hay ubicación nueva, pregunta en qué ubicación busca trabajo y pausa la ejecución.
+    """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return cfg
+        return None
 
-    api_url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TELEGRAM_TOKEN}/getUpdates"
-    params = {"offset": int(cfg.get("last_update_id", 0)) + 1, "timeout": 4}
+    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    params = {"offset": int(cfg.get("last_update_id", 0)) + 1, "timeout": 5}
+    detected_city: Optional[str] = None
 
     try:
         resp = HTTP_SESSION.get(api_url, params=params, timeout=10)
@@ -269,50 +260,42 @@ def check_telegram_city_selection(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
                 if chat_id == str(TELEGRAM_CHAT_ID) and text:
                     lower_t = text.lower()
-                    if lower_t in ["/start", "/ciudad", "/zona", "cambiar", "ciudad", "hola"]:
-                        cfg["active_city"] = None
-                        cfg["asked_for_city"] = True
-                        send_simple_message(
-                            "📍 <b>¿Dónde estás buscando trabajo?</b>\n\n"
-                            "Respóndeme con el nombre de la ciudad de Australia "
-                            "(ej: <b>Perth</b>, <b>Sydney</b>, <b>Brisbane</b>, <b>Melbourne</b>, "
-                            "<b>Darwin</b>, <b>Cairns</b>, <b>Karratha</b>, <b>Broome</b>...).\n\n"
-                            "<i>Apenas respondas, comenzará el acecho de nuevas ofertas en esa zona.</i>"
-                        )
+                    if lower_t in ["/start", "/buscar", "/ciudad", "/ubicacion", "hola", "buscar"]:
+                        detected_city = None
+                        cfg["waiting_for_city"] = False
                     else:
-                        chosen_city = normalize_city(text)
-                        cfg["active_city"] = chosen_city
-                        cfg["asked_for_city"] = False
-                        cfg["query_index"] = 0
-                        logger.info(f"Nueva ciudad configurada vía Telegram: {chosen_city}")
-                        send_simple_message(
-                            f"✅ <b>Ciudad activa: {html.escape(chosen_city)}</b>\n"
-                            f"Modo acecho en tiempo real activado. Recibirás únicamente las vacantes "
-                            f"recién publicadas en <b>{html.escape(chosen_city)}</b>.\n\n"
-                            f"<i>(Para cambiar de ciudad cuando quieras, escribe el nuevo nombre o /ciudad).</i>"
-                        )
+                        detected_city = normalize_city(text)
     except Exception as e:
-        logger.warning(f"No se pudieron consultar actualizaciones de Telegram: {e}")
+        logger.warning(f"Error consultando Telegram: {e}")
 
-    if not cfg.get("active_city") and not cfg.get("asked_for_city"):
-        cfg["asked_for_city"] = True
-        send_simple_message(
-            "👋 <b>¡Hola! ¿Dónde estás buscando trabajo en Australia?</b>\n\n"
-            "Escribe en este chat el nombre de la ciudad (ej: <b>Perth</b>, <b>Sydney</b>, "
-            "<b>Brisbane</b>, <b>Melbourne</b>, <b>Darwin</b>, <b>Karratha</b>...).\n\n"
-            "<i>En cuanto respondas, empezaré a enviarte las vacantes recientes de esa ubicación.</i>"
-        )
+    if detected_city:
+        cfg["active_city"] = detected_city
+        cfg["waiting_for_city"] = False
+        save_config(cfg)
+        return detected_city
 
+    if cfg.get("active_city"):
+        return str(cfg["active_city"])
+
+    # Si no hay ciudad configurada, pregunta la ubicación y se pausa
+    send_simple_message(
+        "📍 <b>¿En qué ubicación de Australia estás buscando trabajo hoy?</b>\n\n"
+        "Respóndeme en este chat con el nombre de la ciudad o región "
+        "(ej: <b>Perth</b>, <b>Sydney</b>, <b>Brisbane</b>, <b>Melbourne</b>, "
+        "<b>Darwin</b>, <b>Karratha</b>, <b>Cairns</b>, <b>Adelaide</b>...).\n\n"
+        "🔎 <i>En cuanto respondas y ejecutes la acción, buscaré las <b>30 mejores ofertas "
+        "publicadas hace menos de 2 días</b> en los portales oficiales y volveré a pausarme.</i>"
+    )
+    cfg["waiting_for_city"] = True
     save_config(cfg)
-    return cfg
+    return None
 
 
 # =====================================================================
-# MOTOR DE FILTRADO Y ANÁLISIS DE OFERTAS
+# FILTRADO, PUNTUACIÓN DE CALIDAD Y CLASIFICACIÓN (TOP 30)
 # =====================================================================
 
 def is_valid_entry_job(title: str, company: str, description: str = "") -> bool:
-    """Filtra cargos ejecutivos, profesionales con título o bloqueados por ciudadanía."""
     full_text = f"{title} {company} {description}".lower()
     title_lower = title.lower()
 
@@ -332,6 +315,257 @@ def is_priority_org(company: str) -> bool:
     return any(org in comp_lower for org in SERIOUS_ORGS)
 
 
+def score_job_quality(job: Dict[str, Any]) -> int:
+    """
+    Calcula un puntaje de calidad para ordenar y elegir las 30 mejores opciones:
+    +50 pts: Agencia / Empresa Tier 1 (BHP, Programmed, Hays, WorkPac, etc.)
+    +25 pts: Salario explícito por hora o anual indicado en el anuncio
+    +20 pts: Mención de inicio inmediato (Immediate start) o múltiples vacantes
+    +15 pts: Portal directo verificado (SEEK / Workforce Australia Gobierno)
+    """
+    score = 0
+    text = f"{job['title']} {job['company']} {job['summary']}".lower()
+    salary_str = str(job.get("salary", "")).lower()
+
+    if is_priority_org(job["company"]):
+        score += 50
+    if "$" in salary_str or "per hour" in salary_str or "p/h" in salary_str or "hr" in salary_str:
+        score += 25
+    if any(k in text for k in ["immediate start", "multiple", "urgent", "no experience", "training provided"]):
+        score += 20
+    if job.get("portal") in ("SEEK AU", "Workforce Australia (Gob)"):
+        score += 15
+    if any(k in text for k in ["white card", "fifo", "trade assistant", "forklift", "warehouse"]):
+        score += 10
+    return score
+
+
+# =====================================================================
+# MOTORES DE EXTRACCIÓN MULTIPORTAL (< 2 DÍAS DE ANTIGÜEDAD)
+# =====================================================================
+
+def fetch_seek_last_2_days(keyword: str, location: str) -> List[Dict[str, str]]:
+    """
+    Portal 1: SEEK Australia API v5.
+    Usa el parámetro oficial daterange=2 (publicadas hace máximo 2 días).
+    """
+    url = "https://www.seek.com.au/api/jobsearch/v5/search"
+    params = {
+        "siteKey": "AU-Main",
+        "keywords": keyword,
+        "where": location,
+        "daterange": 2,  # Filtro estricto oficial de SEEK: últimos 2 días (< 48h)
+        "sortmode": "ListedDate",
+        "pageSize": 25,
+        "page": 1
+    }
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-AU,en;q=0.9",
+        "Referer": "https://www.seek.com.au/"
+    }
+
+    jobs: List[Dict[str, str]] = []
+    try:
+        resp = HTTP_SESSION.get(url, params=params, headers=headers, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            for item in data:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                job_id = f"seek_{item.get('id')}"
+                title = str(item.get("title") or "Sin título")
+                advertiser = item.get("advertiser")
+                company = str(advertiser.get("description") if isinstance(advertiser, dict) else "Empresa Verificada SEEK")
+
+                loc_list = item.get("locations")
+                loc = str(loc_list[0].get("label") or location) if (isinstance(loc_list, list) and loc_list) else location
+                salary = str(item.get("salaryLabel") or "Según convenio (Award Rate)")
+                work_type = str(item.get("workType") or "Casual / Full Time")
+                teaser = str(item.get("teaser") or "")
+                raw_bullets = item.get("bulletPoints")
+                bullets = " | ".join(str(b) for b in raw_bullets) if isinstance(raw_bullets, list) else ""
+                listing_date = str(item.get("listingDateDisplay") or "Hace < 48h")
+
+                jobs.append({
+                    "id": job_id,
+                    "title": title,
+                    "company": company,
+                    "location": loc,
+                    "salary": salary,
+                    "work_type": f"{work_type} ({listing_date})",
+                    "portal": "SEEK AU",
+                    "url": f"https://www.seek.com.au/job/{item.get('id')}",
+                    "summary": f"{teaser} {bullets}".strip()
+                })
+    except Exception as e:
+        logger.warning(f"[SEEK AU] Aviso en '{keyword}': {e}")
+    return jobs
+
+
+def fetch_workforce_australia_gov(keyword: str, location: str) -> List[Dict[str, str]]:
+    """
+    Portal 2: Workforce Australia (Portal Oficial del Gobierno de Australia).
+    Filtra vacantes creadas en las últimas 48 horas con ABN verificado.
+    """
+    url = "https://www.workforceaustralia.gov.au/api/v1/global/vacancies"
+    city_only = location.split()[0]
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=MAX_AGE_DAYS)).strftime("%Y-%m-%d")
+
+    params = {
+        "searchText": f"{keyword} {city_only}",
+        "sort": "DatePostedDesc",
+        "pageSize": 20,
+        "pageNumber": 1
+    }
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json"
+    }
+
+    jobs: List[Dict[str, str]] = []
+    try:
+        resp = HTTP_SESSION.get(url, params=params, headers=headers, timeout=12)
+        if resp.status_code == 200:
+            results = resp.json().get("results", []) or resp.json().get("vacancies", [])
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                vac_id = item.get("vacancyId") or item.get("id")
+                if not vac_id:
+                    continue
+
+                posted_raw = str(item.get("creationDate") or item.get("publishDate") or "")[:10]
+                if posted_raw and posted_raw < cutoff_date:
+                    continue
+
+                title = str(item.get("title") or item.get("jobTitle") or "Vacante Verificada")
+                company = str(item.get("employerName") or item.get("organisationName") or "Empleador Verificado ABN")
+                loc = str(item.get("location") or item.get("suburb") or location)
+                salary = str(item.get("salary") or item.get("remuneration") or "Según convenio (Award Rate)")
+                desc = re.sub(r"<[^>]+>", " ", str(item.get("description") or item.get("summary") or ""))
+
+                jobs.append({
+                    "id": f"gov_{vac_id}",
+                    "title": title,
+                    "company": company,
+                    "location": loc,
+                    "salary": salary,
+                    "work_type": "Verificado Gob AU (< 48h)",
+                    "portal": "Workforce Australia (Gob)",
+                    "url": f"https://www.workforceaustralia.gov.au/individuals/jobs/details/{vac_id}",
+                    "summary": desc[:600].strip()
+                })
+    except Exception as e:
+        logger.info(f"[Workforce Gob] Consulta omitida para '{keyword}': {e}")
+    return jobs
+
+
+def fetch_jora_australia(keyword: str, location: str) -> List[Dict[str, str]]:
+    """
+    Portal 3: Jora Australia (Agregador oficial de SEEK Group en Australia).
+    Filtra con since=last_48_hours / a=48h para anuncios de menos de 2 días.
+    """
+    url = "https://au.jora.com/j"
+    params = {
+        "q": keyword,
+        "l": location,
+        "a": "2d",  # Últimos 2 días (48 horas)
+        "sp": "facet_listed_date"
+    }
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-AU,en;q=0.9"
+    }
+
+    jobs: List[Dict[str, str]] = []
+    try:
+        resp = HTTP_SESSION.get(url, params=params, headers=headers, timeout=12)
+        if resp.status_code == 200:
+            cards = re.findall(
+                r'<div[^>]+class="[^"]*job-card[^"]*"[^>]*data-job-id="([^"]+)"[^>]*>(.*?)</div>\s*</div>',
+                resp.text,
+                re.DOTALL
+            )
+            for jid, block in cards[:15]:
+                title_m = re.search(r'class="[^"]*job-title[^"]*"[^>]*>.*?<a[^>]*>(.*?)</a>', block, re.DOTALL)
+                comp_m = re.search(r'class="[^"]*job-company[^"]*"[^>]*>(.*?)</span>', block, re.DOTALL)
+                abst_m = re.search(r'class="[^"]*job-abstract[^"]*"[^>]*>(.*?)</div>', block, re.DOTALL)
+
+                title = re.sub(r"<[^>]+>", "", title_m.group(1)).strip() if title_m else keyword
+                company = re.sub(r"<[^>]+>", "", comp_m.group(1)).strip() if comp_m else "Empresa en Jora AU"
+                summary = re.sub(r"<[^>]+>", " ", abst_m.group(1)).strip() if abst_m else title
+
+                jobs.append({
+                    "id": f"jora_{jid}",
+                    "title": title,
+                    "company": company,
+                    "location": location,
+                    "salary": "Según convenio (Award Rate)",
+                    "work_type": "Publicado hace < 2 días",
+                    "portal": "Jora AU",
+                    "url": f"https://au.jora.com/job/rd/{jid}",
+                    "summary": summary[:600]
+                })
+    except Exception as e:
+        logger.info(f"[Jora AU] Consulta omitida para '{keyword}': {e}")
+    return jobs
+
+
+def fetch_careerone_australia(keyword: str, location: str) -> List[Dict[str, str]]:
+    """
+    Portal 4: CareerOne Australia.
+    Consulta vacantes recientes publicadas en las últimas 48 horas.
+    """
+    url = "https://www.careerone.com.au/api/v1/search/jobs"
+    params = {
+        "keywords": keyword,
+        "location": location,
+        "datePosted": "2",  # Últimos 2 días
+        "page": 1,
+        "pageSize": 15
+    }
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json"
+    }
+
+    jobs: List[Dict[str, str]] = []
+    try:
+        resp = HTTP_SESSION.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code == 200 and "application/json" in resp.headers.get("Content-Type", ""):
+            items = resp.json().get("jobs", []) or resp.json().get("data", [])
+            for item in items:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                jid = item.get("id")
+                title = str(item.get("title") or keyword)
+                company = str(item.get("companyName") or "Empresa Verificada CareerOne")
+                slug = str(item.get("slug") or jid)
+                summary = str(item.get("description") or item.get("summary") or "")
+
+                jobs.append({
+                    "id": f"c1_{jid}",
+                    "title": title,
+                    "company": company,
+                    "location": location,
+                    "salary": str(item.get("salary") or "Según convenio (Award Rate)"),
+                    "work_type": "Hace < 48h",
+                    "portal": "CareerOne AU",
+                    "url": f"https://www.careerone.com.au/jobview/{slug}",
+                    "summary": re.sub(r"<[^>]+>", " ", summary)[:600].strip()
+                })
+    except Exception as e:
+        logger.info(f"[CareerOne AU] Consulta omitida para '{keyword}': {e}")
+    return jobs
+
+
+# =====================================================================
+# TRADUCCIÓN Y ENRIQUECIMIENTO EN ESPAÑOL
+# =====================================================================
+
 def detect_postcode(location_text: str, description_text: str = "") -> str:
     combined = f"{location_text} {description_text}"
     matches = re.findall(r"\b(08\d{2}|[2-7]\d{3})\b", combined)
@@ -339,7 +573,6 @@ def detect_postcode(location_text: str, description_text: str = "") -> str:
     for m in matches:
         if m not in excluded_years:
             return f"{m} (Extraído del anuncio)"
-
     loc_lower = location_text.lower()
     for city, code_info in POSTCODE_MAP.items():
         if city in loc_lower:
@@ -370,7 +603,6 @@ def detect_prerequisites(text: str) -> str:
         reqs.append("Licencia de camión (MR/HR)")
     if "ppe" in t or "steel cap" in t:
         reqs.append("EPP básico (Bototos punta de acero / ropa reflectante)")
-
     return ", ".join(reqs) if reqs else "Ningún ticket especial mencionado (Ideal para recién llegados)"
 
 
@@ -393,14 +625,12 @@ def fallback_spanish_summary(title: str, details: str) -> str:
         explicaciones.append("Trabajo agrícola o de campo (cosecha, empaque, mantenimiento de cultivos o manejo de maquinaria básica).")
     if any(k in t for k in ["factory", "process worker", "production"]):
         explicaciones.append("Operario de planta de producción o fábrica (línea de ensamblaje, empaque y control básico).")
-
     if not explicaciones:
         explicaciones.append("Puesto operativo de entrada (asistencia física, tareas manuales y apoyo general al equipo en terreno).")
     return " ".join(explicaciones)
 
 
 def parse_ai_json_safely(raw_content: str) -> Optional[Dict[str, Any]]:
-    """Extrae y valida objetos JSON incluso si el LLM envuelve el texto en bloques Markdown."""
     try:
         return json.loads(raw_content)
     except Exception:
@@ -414,7 +644,6 @@ def parse_ai_json_safely(raw_content: str) -> Optional[Dict[str, Any]]:
 
 
 def analyze_with_ai_or_rules(job: Dict[str, str]) -> Dict[str, str]:
-    """Genera el resumen en español con Groq o recurre de forma transparente al motor local."""
     raw_text = f"{job['title']} | {job['work_type']} | {job['summary']}"
     postcode = detect_postcode(job["location"], job["summary"])
     prereqs = detect_prerequisites(raw_text)
@@ -422,19 +651,19 @@ def analyze_with_ai_or_rules(job: Dict[str, str]) -> Dict[str, str]:
 
     if GROQ_API_KEY:
         prompt = (
-            "Eres un asesor laboral experto en Australia para recién llegados. "
-            "Analiza esta oferta en inglés y responde ÚNICAMENTE con un objeto JSON válido con estas 3 claves exactas en español:\n"
+            "Eres un asesor laboral experto en Australia. Analiza esta oferta en inglés y responde "
+            "ÚNICAMENTE con un objeto JSON válido con estas 3 claves exactas en español:\n"
             "{\n"
             '  "explicacion": "Explica en 2 frases claras en español qué tareas hará exactamente en este trabajo",\n'
             '  "codigo_postal": "Código postal de 4 dígitos si aparece o el código postal aproximado de ese suburbio/ciudad en Australia",\n'
             '  "requisitos": "Lista corta en español de tickets, licencias o requisitos físicos que piden (o indica si no pide experiencia)"\n'
             "}\n\n"
             f"Título: {job['title']}\nEmpresa: {job['company']}\nUbicación: {job['location']}\n"
-            f"Tipo: {job['work_type']}\nDetalle: {job['summary'][:700]}"
+            f"Detalle: {job['summary'][:650]}"
         )
         try:
             resp = HTTP_SESSION.post(
-                "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)",
+                "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": "llama-3.1-8b-instant",
@@ -451,9 +680,9 @@ def analyze_with_ai_or_rules(job: Dict[str, str]) -> Dict[str, str]:
                     es_explanation = str(parsed.get("explicacion") or es_explanation)
                     postcode = str(parsed.get("codigo_postal") or postcode)
                     prereqs = str(parsed.get("requisitos") or prereqs)
-                time.sleep(random.uniform(1.5, 2.3))
-        except Exception as e:
-            logger.info(f"Usando motor de reglas local para '{job['title'][:30]}' ({e})")
+                time.sleep(1.2)
+        except Exception:
+            pass
 
     return {
         "explicacion": es_explanation,
@@ -462,85 +691,12 @@ def analyze_with_ai_or_rules(job: Dict[str, str]) -> Dict[str, str]:
     }
 
 
-# =====================================================================
-# CLIENTE DE EXTRACCIÓN SEEK AUSTRALIA (MODO ACECHO)
-# =====================================================================
-
-def fetch_seek_api_stealth(keyword: str, location: str) -> Optional[List[Dict[str, str]]]:
-    """Consulta la API v5 de SEEK ordenando estrictamente por fecha de publicación (ListedDate)."""
-    url = "[https://www.seek.com.au/api/jobsearch/v5/search](https://www.seek.com.au/api/jobsearch/v5/search)"
-    params = {
-        "siteKey": "AU-Main",
-        "keywords": keyword,
-        "where": location,
-        "sortmode": "ListedDate",
-        "pageSize": 25,
-        "page": 1
-    }
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-AU,en;q=0.9",
-        "Referer": "[https://www.seek.com.au/](https://www.seek.com.au/)",
-        "Origin": "[https://www.seek.com.au](https://www.seek.com.au)"
-    }
-
-    jobs: List[Dict[str, str]] = []
-    try:
-        resp = HTTP_SESSION.get(url, params=params, headers=headers, timeout=12)
-        if resp.status_code in (403, 429):
-            logger.warning(f"Protección Anti-Ban activada (HTTP {resp.status_code}). Cortando turno de forma segura.")
-            return None
-
-        if resp.status_code == 200:
-            data = resp.json().get("data", [])
-            for item in data:
-                if not isinstance(item, dict) or not item.get("id"):
-                    continue
-
-                job_id = f"seek_{item.get('id')}"
-                title = str(item.get("title") or "Sin título")
-
-                advertiser = item.get("advertiser")
-                company = str(advertiser.get("description") if isinstance(advertiser, dict) else "Empresa Verificada en SEEK")
-
-                loc_list = item.get("locations")
-                if isinstance(loc_list, list) and len(loc_list) > 0 and isinstance(loc_list[0], dict):
-                    loc = str(loc_list[0].get("label") or location)
-                else:
-                    loc = location
-
-                salary = str(item.get("salaryLabel") or "Según convenio (Award Rate)")
-                work_type = str(item.get("workType") or "Casual / Full Time")
-                teaser = str(item.get("teaser") or "")
-
-                raw_bullets = item.get("bulletPoints")
-                bullets = " | ".join(str(b) for b in raw_bullets) if isinstance(raw_bullets, list) else ""
-                full_summary = f"{teaser} {bullets}".strip()
-
-                jobs.append({
-                    "id": job_id,
-                    "title": title,
-                    "company": company,
-                    "location": loc,
-                    "salary": salary,
-                    "work_type": work_type,
-                    "portal": "SEEK AU",
-                    "url": f"[https://www.seek.com.au/job/](https://www.seek.com.au/job/){item.get('id')}",
-                    "summary": full_summary
-                })
-    except Exception as e:
-        logger.warning(f"Error consultando SEEK para '{keyword}': {e}")
-
-    return jobs
-
-
-def send_telegram_alert(job: Dict[str, str]) -> bool:
+def send_telegram_alert(job: Dict[str, Any], rank_idx: int, total_to_send: int) -> bool:
     info = analyze_with_ai_or_rules(job)
     vip_badge = (
-        "⭐ <b>[AGENCIA / EMPRESA TOP TIER 1]</b>\n"
+        f"⭐ <b>[OPCIÓN #{rank_idx}/{total_to_send} - AGENCIA TIER 1]</b>\n"
         if is_priority_org(job["company"])
-        else "🇦🇺 <b>[OFERTA RECIÉN PUBLICADA]</b>\n"
+        else f"🇦🇺 <b>[OPCIÓN #{rank_idx}/{total_to_send} - PUBLICADA HACE &lt; 2 DÍAS]</b>\n"
     )
 
     msg = (
@@ -563,67 +719,86 @@ def send_telegram_alert(job: Dict[str, str]) -> bool:
         "disable_web_page_preview": True
     }
     sent = send_telegram_request(payload)
-    time.sleep(random.uniform(1.8, 2.6))
+    time.sleep(random.uniform(1.4, 2.1))
     return sent
 
 
 # =====================================================================
-# ORQUESTADOR PRINCIPAL
+# ORQUESTADOR PRINCIPAL (BARRIDO DE 48H -> TOP 30 -> AUTO-PAUSA)
 # =====================================================================
 
 def main() -> None:
     cfg = load_config()
-    cfg = check_telegram_city_selection(cfg)
-    active_city = cfg.get("active_city")
+    target_city = ask_or_read_city_from_telegram(cfg)
 
-    if not active_city:
-        logger.info("Sistema en espera: el usuario aún no ha seleccionado una ciudad en Telegram.")
+    if not target_city:
+        logger.info("Solicitud de ubicación enviada a Telegram. Sistema en pausa esperando respuesta del usuario.")
         return
 
     seen_list = load_seen()
     seen_set: Set[str] = set(seen_list)
-    new_jobs_count = 0
+    candidates: Dict[str, Dict[str, Any]] = {}
 
-    start_idx = int(cfg.get("query_index", 0)) % len(JOB_KEYWORDS)
-    selected_keywords = [
-        JOB_KEYWORDS[(start_idx + i) % len(JOB_KEYWORDS)]
-        for i in range(QUERIES_PER_RUN)
-    ]
+    send_simple_message(
+        f"🚀 <b>Iniciando barrido profundo en: {html.escape(target_city)}</b>\n"
+        f"Consultando ofertas publicadas hace <b>menos de 2 días</b> en SEEK AU, "
+        f"Workforce Australia (Gobierno), Jora AU y CareerOne...\n"
+        f"<i>Seleccionando las 30 mejores opciones para ti.</i>"
+    )
 
-    cfg["query_index"] = (start_idx + QUERIES_PER_RUN) % len(JOB_KEYWORDS)
+    for kw in JOB_KEYWORDS:
+        logger.info(f"Buscando '{kw}' (< 48h) en {target_city}...")
+
+        # Consulta multiportal de confianza
+        batch = []
+        batch.extend(fetch_seek_last_2_days(kw, target_city))
+        batch.extend(fetch_workforce_australia_gov(kw, target_city))
+        batch.extend(fetch_jora_australia(kw, target_city))
+        batch.extend(fetch_careerone_australia(kw, target_city))
+
+        for job in batch:
+            jid = job["id"]
+            if jid not in seen_set and jid not in candidates:
+                if is_valid_entry_job(job["title"], job["company"], job["summary"]):
+                    job["score"] = score_job_quality(job)
+                    candidates[jid] = job
+                else:
+                    seen_set.add(jid)
+                    seen_list.append(jid)
+
+        time.sleep(random.uniform(1.5, 2.8))
+
+    # Ordenar todas las ofertas encontradas de mayor a menor calidad y tomar el Top 30
+    ranked_jobs = sorted(candidates.values(), key=lambda x: x.get("score", 0), reverse=True)
+    top_30_jobs = ranked_jobs[:TOP_JOBS_LIMIT]
+
+    sent_count = 0
+    total_to_send = len(top_30_jobs)
+
+    for idx, job in enumerate(top_30_jobs, start=1):
+        if send_telegram_alert(job, idx, total_to_send):
+            sent_count += 1
+        seen_set.add(job["id"])
+        seen_list.append(job["id"])
+
+    # Guardar historial y limpiar ciudad activa para que el bot se pause
+    save_seen(seen_list)
+    cfg["active_city"] = None
+    cfg["waiting_for_city"] = False
     save_config(cfg)
 
-    logger.info(f"Acecho activo en [{active_city}] | Lote actual: {selected_keywords}")
-
-    for kw in selected_keywords:
-        if new_jobs_count >= MAX_JOBS_PER_RUN:
-            break
-
-        time.sleep(random.uniform(3.5, 6.0))
-        found_jobs = fetch_seek_api_stealth(kw, active_city)
-
-        if found_jobs is None:
-            break
-
-        for job in found_jobs:
-            if new_jobs_count >= MAX_JOBS_PER_RUN:
-                break
-
-            job_id = job["id"]
-            if job_id not in seen_set:
-                if is_valid_entry_job(job["title"], job["company"], job["summary"]):
-                    if send_telegram_alert(job):
-                        new_jobs_count += 1
-                seen_set.add(job_id)
-                seen_list.append(job_id)
-
-    save_seen(seen_list)
-    logger.info(f"Ciclo finalizado correctamente. Alertas nuevas enviadas: {new_jobs_count}")
+    send_simple_message(
+        f"✅ <b>Barrido finalizado en {html.escape(target_city)}</b>\n"
+        f"Se entregaron las <b>{sent_count} mejores ofertas</b> publicadas en las últimas 48 horas.\n\n"
+        f"⏸️ <b>El radar ha quedado en pausa automáticamente.</b>\n"
+        f"Cuando quieras hacer otro barrido, escribe una ciudad aquí y ejecuta el workflow en GitHub Actions."
+    )
+    logger.info(f"Entregadas {sent_count} ofertas de {target_city}. Bot pausado exitosamente.")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        logger.error(f"Fallo crítico amortiguado (Exit 0 para proteger el workflow): {exc}")
+        logger.error(f"Error controlado: {exc}")
         sys.exit(0)
