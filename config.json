@@ -1,7 +1,7 @@
 {
   "active_city": null,
-  "last_update_id": 158237034,
-  "waiting_for_city": true,
+  "last_update_id": 158237035,
+  "waiting_for_city": false,
   "asked_for_city": false,
   "query_index": 0
 }
